@@ -4,25 +4,17 @@ import aiohttp
 import asyncio
 import click
 import io
+import random
 import os
 import urllib.parse
 
-from concurrent.futures import ThreadPoolExecutor
 from babel.messages import pofile
+from concurrent.futures import ThreadPoolExecutor
+from lxml import html
 
-class YandexTranslateException(Exception):
-    error_codes = {
-        401: 'ERR_KEY_INVALID',
-        402: 'ERR_KEY_BLOCKED',
-        403: 'ERR_DAILY_REQ_LIMIT_EXCEEDED',
-        404: 'ERR_DAILY_CHAR_LIMIT_EXCEEDED',
-        413: 'ERR_TEXT_TOO_LONG',
-        422: 'ERR_UNPROCESSABLE_TEXT',
-        501: 'ERR_LANG_NOT_SUPPORTED',
-    }
-
+class SphinxTranslateException(Exception):
     def __init__(self, status_code, message, *args, **kwargs):
-        message = self.error_codes.get(status_code, str(status_code)) + ': ' + message
+        message = str(status_code) + ': ' + message
         super(YandexTranslateException, self).__init__(message, *args, **kwargs)
 
 def read_config(path):
@@ -68,29 +60,46 @@ def dump_po(filename, catalog, line_width=76):
 # ==================================
 # translation
 
-api_url = 'https://translate.yandex.net/api/{version}/tr.json/{endpoint}'
-api_version = 'v1.5'
+def parse_translate_result(text):
+    doc = html.fromstring(text)
 
-async def translate_entry(session, text, source_lang, target_lang, api_key):
-    data = {
-        'key': api_key,
-        'text': urllib.parse.quote_plus(text),
-        'lang': f'{source_lang}-{target_lang}'}
-    async with session.post(api_url.format(version=api_version, endpoint='translate'),
-        data=data) as response:
-        result = await response.json()
-        print(data['lang'], result)
-        if result['code'] != 200:
-            raise YandexTranslateException(result['code'], result.get('message'))
+    item = doc.xpath("//div[@dir='ltr']//text()")
+    if not item:
+        return ""
+    # Replace extra ' + ' entries
+    return item[-1].replace(' + ', ' ')
 
-        return urllib.parse.unquote_plus(result['text'][0])
+api_url = 'https://translate.google.pl/m'
 
-async def translate(locale_dir, source_language, target_languages,
-    api_key, line_width):
+async def translate_entry(session, text, source_lang, target_lang):
+    params = {
+        'hl': source_lang,
+        'sl': source_lang,
+        'tl': target_lang,
+        'ie': 'UTF-8',
+        'prev': '_m',
+        'q': urllib.parse.quote_plus(text)
+    }
+
+    # Sleep random milliseconds
+    delay = random.randint(100, 1000) / 1000
+    await asyncio.sleep(delay)
+
+    async with session.get(api_url, params=params) as response:
+        if response.status != 200:
+            raise SphinxTranslateException(response.status, response.reason)
+
+        result = await response.text()
+        return result
+
+async def translate(locale_dir, source_language, target_languages, line_width):
     loop = asyncio.get_running_loop()
 
     with ThreadPoolExecutor() as executor:
-        async with aiohttp.ClientSession() as session:
+        headers = {
+            'User-Agent': 'Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.0)'
+        }
+        async with aiohttp.ClientSession(headers=headers) as session:
             for lang in target_languages:
                 po_dir = os.path.join(locale_dir, lang, 'LC_MESSAGES')
 
@@ -105,14 +114,16 @@ async def translate(locale_dir, source_language, target_languages,
                         need_write = False
 
                         for msg in cat_po:
-                            # Skip already translated text
-                            # if msg.string:
-                                # continue
-                            if not msg.id:
+                            # Skip messages with already translated text or
+                            # with empty source string
+                            if msg.string or not msg.id:
                                 continue
 
-                            msg.string = await translate_entry(session, msg.id,
-                                source_language, lang, api_key)
+                            translate_result = await translate_entry(session, msg.id,
+                                source_language, lang)
+                            msg.string = await loop.run_in_executor(executor,
+                                parse_translate_result, translate_result)
+
                             need_write = True
 
                         if need_write:
@@ -126,7 +137,6 @@ async def translate(locale_dir, source_language, target_languages,
                             except:
                                 os.remove(po_file_tmp)
                                 raise
-                        return
 
     loop.close()
 
@@ -158,15 +168,11 @@ LANGUAGES = LanguagesType()
     type=LANGUAGES, metavar='<LANG>', multiple=True, required=True,
     help='Target language to update po files.')
 @click.option(
-    '-k', '--api-key',
-    envvar='YANDEX_API_KEY', metavar='<YANDEX_API_KEY>', required=True,
-    help='Yandex API key')
-@click.option(
     '-w', '--line-width',
     type=int, default=76, metavar='<WIDTH>', show_default=True, multiple=False,
     help='The maximum line width for the po files, 0 or a negative number '
          'disable line wrapping')
-def main(config, source_language, target_language, api_key, line_width):
+def main(config, source_language, target_language, line_width):
     # load conf.py
     if config is None:
         for c in ('conf.py', 'source/conf.py'):
@@ -190,7 +196,7 @@ def main(config, source_language, target_language, api_key, line_width):
 
     target_languages = sum(target_language, ())
     asyncio.run(
-        translate(locale_dir, source_language, target_languages, api_key, line_width))
+        translate(locale_dir, source_language, target_languages, line_width))
 
 if __name__ == '__main__':
     main()
