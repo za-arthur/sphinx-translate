@@ -63,11 +63,24 @@ def dump_po(filename, catalog, line_width=76):
 def parse_translate_result(text):
     doc = html.fromstring(text)
 
-    item = doc.xpath("//div[@dir='ltr']//text()")
+    item = doc.xpath("//div[@class='t0' and @dir='ltr']//text()")
     if not item:
         return ""
     # Replace extra ' + ' entries
-    return item[-1].replace(' + ', ' ')
+    return (item[-1].replace(' + ', ' ')
+        .replace('C #', 'C#')
+        .replace('C ++', 'C++')
+        .replace('+-+', '-')
+        .replace(' :: ', '::')
+        .replace('! =', '!=')
+        .replace('> =', '>=')
+        .replace(' +', '')
+        .replace(' / ', '/')
+        .replace('../ ', '../')
+        .replace(' // ', '//')
+        .replace(': doc: `', ':doc:`')
+        .replace(': ref: `', ':ref:`')
+        .replace('` _', '`_'))
 
 api_url = 'https://translate.google.pl/m'
 
@@ -78,7 +91,7 @@ async def translate_entry(session, text, source_lang, target_lang):
         'tl': target_lang,
         'ie': 'UTF-8',
         'prev': '_m',
-        'q': urllib.parse.quote_plus(text)
+        'q': text
     }
 
     # Sleep random milliseconds
@@ -137,8 +150,6 @@ async def translate(locale_dir, source_language, target_languages, line_width):
                             except:
                                 os.remove(po_file_tmp)
                                 raise
-
-    loop.close()
 
 # ==================================
 # click options
