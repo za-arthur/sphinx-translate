@@ -60,7 +60,7 @@ def dump_po(filename, catalog, line_width=76):
 # ==================================
 # translation
 
-def parse_translate_result(text):
+def parse_translated_entry(text, filename):
     doc = html.fromstring(text)
 
     item = doc.xpath("//div[@class='t0' and @dir='ltr']//text()")
@@ -84,7 +84,7 @@ def parse_translate_result(text):
 
 api_url = 'https://translate.google.pl/m'
 
-async def translate_entry(session, text, source_lang, target_lang):
+async def translate_entry(session, text, source_lang, target_lang, filename):
     params = {
         'hl': source_lang,
         'sl': source_lang,
@@ -105,6 +105,52 @@ async def translate_entry(session, text, source_lang, target_lang):
         result = await response.text()
         return result
 
+async def get_po_files(locale_dir, languages, q):
+    for lang in languages:
+        po_dir = os.path.join(locale_dir, lang, 'LC_MESSAGES')
+
+        for dirpath, dirnames, filenames in os.walk(po_dir):
+            for filename in filenames:
+                po_file = os.path.join(dirpath, filename)
+                base, ext = os.path.splitext(po_file)
+
+                if ext == ".po":
+                    await q.put((lang, po_file))
+
+async def translate_files(source_language, line_width, loop, executor, session, q):
+    while True:
+        target_language, po_file = await q.get()
+
+        cat_po = await loop.run_in_executor(executor, load_po, po_file)
+        need_write = False
+
+        for msg in cat_po:
+            # Skip messages with already translated text or
+            # with empty source string
+            if msg.string or not msg.id:
+                continue
+
+            translate_result = await translate_entry(session, msg.id,
+                source_language, target_language, po_file)
+            msg.string = await loop.run_in_executor(executor,
+                parse_translated_entry, translate_result, po_file)
+
+            need_write = True
+
+        if need_write:
+            click.echo('Update: {0}'.format(po_file))
+            po_file_tmp = po_file + ".tmp"
+
+            try:
+                await loop.run_in_executor(executor, dump_po,
+                    po_file_tmp, cat_po, line_width)
+                os.replace(po_file_tmp, po_file)
+            except:
+                os.remove(po_file_tmp)
+                raise
+
+        q.task_done()
+
 async def translate(locale_dir, source_language, target_languages, line_width):
     loop = asyncio.get_running_loop()
 
@@ -113,43 +159,16 @@ async def translate(locale_dir, source_language, target_languages, line_width):
             'User-Agent': 'Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.0)'
         }
         async with aiohttp.ClientSession(headers=headers) as session:
-            for lang in target_languages:
-                po_dir = os.path.join(locale_dir, lang, 'LC_MESSAGES')
+            q = asyncio.Queue()
+            producer = asyncio.create_task(get_po_files(locale_dir, target_languages, q))
+            consumers = [asyncio.create_task(translate_files(source_language,
+                line_width, loop, executor, session, q)) for _ in range(4)]
 
-                for dirpath, dirnames, filenames in os.walk(po_dir):
-                    for filename in filenames:
-                        po_file = os.path.join(dirpath, filename)
-                        base, ext = os.path.splitext(po_file)
-                        if ext != ".po":
-                            continue
+            await asyncio.gather(producer)
+            await q.join()
 
-                        cat_po = await loop.run_in_executor(executor, load_po, po_file)
-                        need_write = False
-
-                        for msg in cat_po:
-                            # Skip messages with already translated text or
-                            # with empty source string
-                            if msg.string or not msg.id:
-                                continue
-
-                            translate_result = await translate_entry(session, msg.id,
-                                source_language, lang)
-                            msg.string = await loop.run_in_executor(executor,
-                                parse_translate_result, translate_result)
-
-                            need_write = True
-
-                        if need_write:
-                            click.echo('Update: {0}'.format(po_file))
-                            po_file_tmp = po_file + ".tmp"
-
-                            try:
-                                await loop.run_in_executor(executor, dump_po,
-                                    po_file_tmp, cat_po, line_width)
-                                os.replace(po_file_tmp, po_file)
-                            except:
-                                os.remove(po_file_tmp)
-                                raise
+            for c in consumers:
+                c.cancel()
 
 # ==================================
 # click options
