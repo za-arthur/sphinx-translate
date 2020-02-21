@@ -15,7 +15,7 @@ from lxml import html
 class SphinxTranslateException(Exception):
     def __init__(self, status_code, message, *args, **kwargs):
         message = str(status_code) + ': ' + message
-        super(YandexTranslateException, self).__init__(message, *args, **kwargs)
+        super(SphinxTranslateException, self).__init__(message, *args, **kwargs)
 
 def read_config(path):
     namespace = {
