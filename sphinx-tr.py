@@ -95,7 +95,7 @@ async def translate_entry(session, text, source_lang, target_lang, filename):
     }
 
     # Sleep random milliseconds
-    delay = random.randint(100, 1000) / 1000
+    delay = random.randint(1000, 2000) / 1000
     await asyncio.sleep(delay)
 
     async with session.get(api_url, params=params) as response:
@@ -104,6 +104,8 @@ async def translate_entry(session, text, source_lang, target_lang, filename):
 
         result = await response.text()
         return result
+
+consumers_num = 4
 
 async def get_po_files(locale_dir, languages, q):
     for lang in languages:
@@ -117,39 +119,49 @@ async def get_po_files(locale_dir, languages, q):
                 if ext == ".po":
                     await q.put((lang, po_file))
 
+    # Tell to consumers that there are no files anymore
+    for _ in range(consumers_num):
+        await q.put((None, None))
+
 async def translate_files(source_language, line_width, loop, executor, session, q):
     while True:
         target_language, po_file = await q.get()
 
-        cat_po = await loop.run_in_executor(executor, load_po, po_file)
-        need_write = False
+        try:
+            # Stop translating
+            if (po_file is None):
+                break
 
-        for msg in cat_po:
-            # Skip messages with already translated text or
-            # with empty source string
-            if msg.string or not msg.id:
-                continue
+            cat_po = await loop.run_in_executor(executor, load_po, po_file)
+            need_write = False
 
-            translate_result = await translate_entry(session, msg.id,
-                source_language, target_language, po_file)
-            msg.string = await loop.run_in_executor(executor,
-                parse_translated_entry, translate_result, po_file)
+            for msg in cat_po:
+                # Skip messages with already translated text or
+                # with empty source string
+                if msg.string or not msg.id:
+                    continue
 
-            need_write = True
+                translate_result = await translate_entry(session, msg.id,
+                    source_language, target_language, po_file)
+                msg.string = await loop.run_in_executor(executor,
+                    parse_translated_entry, translate_result, po_file)
 
-        if need_write:
-            click.echo('Update: {0}'.format(po_file))
-            po_file_tmp = po_file + ".tmp"
+                need_write = True
 
-            try:
-                await loop.run_in_executor(executor, dump_po,
-                    po_file_tmp, cat_po, line_width)
-                os.replace(po_file_tmp, po_file)
-            except:
-                os.remove(po_file_tmp)
-                raise
+            if need_write:
+                click.echo('Update: {0}'.format(po_file))
+                po_file_tmp = po_file + ".tmp"
 
-        q.task_done()
+                try:
+                    await loop.run_in_executor(executor, dump_po,
+                        po_file_tmp, cat_po, line_width)
+                    os.replace(po_file_tmp, po_file)
+                except:
+                    os.remove(po_file_tmp)
+                    raise
+
+        finally:
+            q.task_done()
 
 async def translate(locale_dir, source_language, target_languages, line_width):
     loop = asyncio.get_running_loop()
@@ -162,13 +174,9 @@ async def translate(locale_dir, source_language, target_languages, line_width):
             q = asyncio.Queue()
             producer = asyncio.create_task(get_po_files(locale_dir, target_languages, q))
             consumers = [asyncio.create_task(translate_files(source_language,
-                line_width, loop, executor, session, q)) for _ in range(4)]
+                line_width, loop, executor, session, q)) for _ in range(consumers_num)]
 
-            await asyncio.gather(producer)
-            await q.join()
-
-            for c in consumers:
-                c.cancel()
+            await asyncio.gather(producer, *consumers)
 
 # ==================================
 # click options
